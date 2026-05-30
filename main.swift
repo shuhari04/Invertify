@@ -2,6 +2,24 @@ import SwiftUI
 import CoreImage
 import UniformTypeIdentifiers
 import AppKit
+import CoreGraphics
+import Foundation
+
+// Dynamic loading helper for CGWindowListCreateImage (to bypass macOS 15+ compile-time obsoleted error)
+typealias CGWindowListCreateImageFunc = @convention(c) (CGRect, UInt32, CGWindowID, UInt32) -> CGImage?
+
+func dynamicCGWindowListCreateImage(_ screenBounds: CGRect, _ listOption: CGWindowListOption, _ windowID: CGWindowID, _ imageOption: CGWindowImageOption) -> CGImage? {
+    guard let handle = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY) else {
+        return nil
+    }
+    defer { dlclose(handle) }
+    
+    if let sym = dlsym(handle, "CGWindowListCreateImage") {
+        let function = unsafeBitCast(sym, to: CGWindowListCreateImageFunc.self)
+        return function(screenBounds, listOption.rawValue, windowID, imageOption.rawValue)
+    }
+    return nil
+}
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -51,58 +69,115 @@ struct DropZoneView: View {
     let pulseBorder: Bool
     let statusMessage: String
     let errorMessage: String?
+    let underWindowImage: NSImage?
+    let hasPermission: Bool
+    let onRequestPermission: () -> Void
     
     var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: isTargeted ? "arrow.down.doc.fill" : "photo.on.rectangle.angled")
-                .font(.system(size: 48))
-                .foregroundStyle(
-                    LinearGradient(
-                        colors: isTargeted ? [Color.purple, Color.blue] : [Color.gray, Color.gray.opacity(0.6)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .scaleEffect(isTargeted ? 1.1 : 1.0)
-                .animation(.spring(response: 0.3, dampingFraction: 0.6), value: isTargeted)
+        ZStack {
+            // Background preview if permission is granted and we have an image
+            if hasPermission, let preview = underWindowImage {
+                Image(nsImage: preview)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 300, height: 280)
+                    .cornerRadius(16)
+                    .blur(radius: isTargeted ? 10 : 0)
+                    .opacity(isTargeted ? 0.3 : 1.0)
+                    .animation(.easeInOut(duration: 0.2), value: isTargeted)
+            }
             
-            VStack(spacing: 6) {
-                Text(isTargeted ? "Drop it here!" : statusMessage)
-                    .font(.system(size: 15, weight: .bold, design: .rounded))
-                    .foregroundColor(isTargeted ? .primary : .secondary)
-                
-                if let error = errorMessage {
-                    Text(error)
-                        .font(.system(size: 11, weight: .medium, design: .rounded))
-                        .foregroundColor(.red)
+            // Subtle glass overlay on top of the live preview to keep text readable
+            if hasPermission && underWindowImage != nil {
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Color.black.opacity(isTargeted ? 0.35 : 0.25))
+            }
+            
+            // Standard drop zone overlay
+            VStack(spacing: 16) {
+                if !hasPermission {
+                    // No permission warning state
+                    Image(systemName: "camera.badge.ellipsis")
+                        .font(.system(size: 40))
+                        .foregroundStyle(.yellow)
+                    
+                    VStack(spacing: 6) {
+                        Text("Screen Capture Required")
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                            .foregroundColor(.white)
+                        
+                        Text("To enable real-time color inversion of the screen behind the window.")
+                            .font(.system(size: 10, weight: .regular, design: .rounded))
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 16)
+                    }
+                    
+                    Button(action: onRequestPermission) {
+                        Text("Grant Permission")
+                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 6)
+                            .background(Capsule().fill(Color.yellow))
+                    }
+                    .buttonStyle(.plain)
                 } else {
-                    Text("PNG, JPG, WEBP formats")
-                        .font(.system(size: 11, weight: .regular, design: .rounded))
-                        .foregroundColor(.secondary.opacity(0.7))
+                    // Normal state
+                    Image(systemName: isTargeted ? "arrow.down.doc.fill" : "photo.on.rectangle.angled")
+                        .font(.system(size: 40))
+                        .foregroundStyle(
+                            LinearGradient(
+                                colors: isTargeted ? [Color.purple, Color.blue] : [Color.white, Color.white.opacity(0.6)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .scaleEffect(isTargeted ? 1.1 : 1.0)
+                        .shadow(radius: underWindowImage != nil ? 4 : 0)
+                        .animation(.spring(response: 0.3, dampingFraction: 0.6), value: isTargeted)
+                    
+                    VStack(spacing: 6) {
+                        Text(isTargeted ? "Drop it here!" : (underWindowImage != nil ? "Lens Active: Inverting Screen" : statusMessage))
+                            .font(.system(size: 14, weight: .bold, design: .rounded))
+                            .foregroundColor(.white)
+                            .shadow(radius: underWindowImage != nil ? 2 : 0)
+                        
+                        if let error = errorMessage {
+                            Text(error)
+                                .font(.system(size: 11, weight: .medium, design: .rounded))
+                                .foregroundColor(.red)
+                        } else {
+                            Text(underWindowImage != nil ? "Drag window to scan / Drop image to lock" : "PNG, JPG, WEBP formats")
+                                .font(.system(size: 10, weight: .regular, design: .rounded))
+                                .foregroundColor(.secondary)
+                                .shadow(radius: underWindowImage != nil ? 1 : 0)
+                        }
+                    }
                 }
             }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 16)
-                .fill(isTargeted ? Color.white.opacity(0.08) : Color.white.opacity(0.03))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .strokeBorder(
-                    LinearGradient(
-                        colors: isTargeted 
-                            ? [Color.purple, Color.blue] 
-                            : [Color.white.opacity(pulseBorder ? 0.3 : 0.15)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    style: StrokeStyle(
-                        lineWidth: isTargeted ? 3 : 2,
-                        dash: isTargeted ? [] : [8, 6]
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(isTargeted ? Color.white.opacity(0.08) : Color.white.opacity(0.02))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: isTargeted 
+                                ? [Color.purple, Color.blue] 
+                                : [Color.white.opacity(pulseBorder ? 0.3 : 0.15)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        style: StrokeStyle(
+                            lineWidth: isTargeted ? 3 : 2,
+                            dash: isTargeted ? [] : [8, 6]
+                        )
                     )
-                )
-        )
+            )
+        }
     }
 }
 
@@ -114,6 +189,10 @@ struct ContentView: View {
     @State private var isProcessing = false
     @State private var statusMessage = "Drag & Drop Image Here"
     @State private var errorMessage: String? = nil
+    
+    // Live x-ray preview states
+    @State private var underWindowImage: NSImage? = nil
+    @State private var hasScreenCapturePermission = true
     
     // Animation states
     @State private var pulseBorder = false
@@ -218,11 +297,19 @@ struct ContentView: View {
                             .buttonStyle(.plain)
                         }
                     } else {
-                        // Empty / Drop Zone
-                        DropZoneView(isTargeted: isTargeted, pulseBorder: pulseBorder, statusMessage: statusMessage, errorMessage: errorMessage)
-                            .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
-                                handleDrop(providers: providers)
-                            }
+                        // Empty / Drop Zone (Displays live preview lens if no file dropped)
+                        DropZoneView(
+                            isTargeted: isTargeted,
+                            pulseBorder: pulseBorder,
+                            statusMessage: statusMessage,
+                            errorMessage: errorMessage,
+                            underWindowImage: underWindowImage,
+                            hasPermission: hasScreenCapturePermission,
+                            onRequestPermission: requestPermission
+                        )
+                        .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
+                            handleDrop(providers: providers)
+                        }
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -231,9 +318,28 @@ struct ContentView: View {
             }
         }
         .onAppear {
+            // Check permission immediately
+            self.hasScreenCapturePermission = CGPreflightScreenCaptureAccess()
+            
             withAnimation(Animation.easeInOut(duration: 1.5).repeatForever(autoreverses: true)) {
                 pulseBorder = true
             }
+            
+            // Trigger an initial capture shortly after launch
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                self.captureAndInvertUnderWindow()
+            }
+        }
+        // Capture window dragging and resizing
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didMoveNotification)) { _ in
+            self.captureAndInvertUnderWindow()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResizeNotification)) { _ in
+            self.captureAndInvertUnderWindow()
+        }
+        // Capture when app is active again
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            self.captureAndInvertUnderWindow()
         }
     }
     
@@ -243,6 +349,91 @@ struct ContentView: View {
         invertedImageURL = nil
         statusMessage = "Drag & Drop Image Here"
         errorMessage = nil
+        // Trigger capture to resume lens
+        self.captureAndInvertUnderWindow()
+    }
+    
+    private func requestPermission() {
+        let authorized = CGRequestScreenCaptureAccess()
+        if authorized {
+            self.hasScreenCapturePermission = true
+            self.captureAndInvertUnderWindow()
+        } else {
+            // If already prompted and denied, open System Settings directly to the tab
+            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                NSWorkspace.shared.open(url)
+            }
+        }
+    }
+    
+    private func captureAndInvertUnderWindow() {
+        // Only run capture if we aren't showing a user-inverted image
+        guard originalImage == nil else { return }
+        
+        // Find our application window
+        guard let window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first(where: { $0.isVisible && $0.parent == nil }) else {
+            return
+        }
+        
+        let windowID = CGWindowID(window.windowNumber)
+        let windowFrame = window.frame
+        
+        // Primary screen frame height to convert bottom-left to top-left Y coordinates
+        guard let primaryScreen = NSScreen.screens.first else { return }
+        let primaryHeight = primaryScreen.frame.height
+        
+        // Dash box dimensions: 300 width, 280 height
+        let captureWidth: CGFloat = 300
+        let captureHeight: CGFloat = 280
+        
+        // Centered horizontally
+        let captureX = windowFrame.origin.x + (windowFrame.width - captureWidth) / 2
+        
+        // Positioned 44px offset from the window bottom (accounting for paddings/spacings)
+        let captureY = windowFrame.origin.y + 44
+        
+        // Convert to Core Graphics top-left origin coordinate space
+        let cgY = primaryHeight - (captureY + captureHeight)
+        let captureRect = CGRect(x: captureX, y: cgY, width: captureWidth, height: captureHeight)
+        
+        // Check screen capture permissions
+        let hasAccess = CGPreflightScreenCaptureAccess()
+        if hasAccess != self.hasScreenCapturePermission {
+            DispatchQueue.main.async {
+                self.hasScreenCapturePermission = hasAccess
+            }
+        }
+        
+        guard hasAccess else { return }
+        
+        // Run dynamic CGWindowListCreateImage on interactive background queue
+        DispatchQueue.global(qos: .userInteractive).async {
+            guard let cgImage = dynamicCGWindowListCreateImage(
+                captureRect,
+                .optionOnScreenBelowWindow,
+                windowID,
+                .nominalResolution
+            ) else {
+                return
+            }
+            
+            // Invert colors using Core Image
+            let ciImage = CIImage(cgImage: cgImage)
+            let filter = CIFilter(name: "CIColorInvert")
+            filter?.setValue(ciImage, forKey: kCIInputImageKey)
+            
+            guard let outputImage = filter?.outputImage else { return }
+            
+            let context = CIContext(options: nil)
+            guard let cgImageOutput = context.createCGImage(outputImage, from: outputImage.extent) else { return }
+            
+            let size = NSSize(width: captureWidth, height: captureHeight)
+            let invertedNSImage = NSImage(cgImage: cgImageOutput, size: size)
+            
+            DispatchQueue.main.async {
+                self.underWindowImage = invertedNSImage
+            }
+        }
     }
     
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
