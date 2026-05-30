@@ -1,0 +1,11 @@
+# macOS System files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Build and temporary files
+build/
+*.o
+*.app
+InvertTest
+AppIcon.iconset/
